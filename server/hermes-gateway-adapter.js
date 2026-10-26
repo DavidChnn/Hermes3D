@@ -29,6 +29,111 @@ const child_process = require("child_process");
 const { WebSocketServer } = require("ws");
 
 const AGENTS_DIR = path.resolve("/home/ubuntu/hq/agents");
+const KANBAN_DB_PATH = "/home/ubuntu/.hermes/kanban/boards/kreasi-kita/kanban.db";
+const SKILLS_DIR = "/home/ubuntu/.hermes/skills";
+
+let DatabaseSync = null;
+try {
+  DatabaseSync = require("node:sqlite").DatabaseSync;
+} catch {
+  DatabaseSync = null;
+}
+
+function getKanbanDb(readOnly = false) {
+  if (!DatabaseSync || !fs.existsSync(KANBAN_DB_PATH)) return null;
+  try {
+    return new DatabaseSync(KANBAN_DB_PATH, { readOnly });
+  } catch (err) {
+    console.error("[hermes-adapter] Kanban DB open error:", err.message);
+    return null;
+  }
+}
+
+function mapKanbanToGatewayStatus(status) {
+  switch (status) {
+    case "ready":
+      return "scheduled";
+    case "in_progress":
+      return "working";
+    case "blocked":
+    case "review":
+      return "needs_attention";
+    case "done":
+      return "done";
+    case "backlog":
+    case "triage":
+    default:
+      return "inbox";
+  }
+}
+
+function mapGatewayToKanbanStatus(status) {
+  switch (status) {
+    case "scheduled":
+      return "ready";
+    case "working":
+      return "in_progress";
+    case "needs_attention":
+      return "blocked";
+    case "done":
+      return "done";
+    case "inbox":
+    default:
+      return "backlog";
+  }
+}
+
+function formatTaskRecord(row) {
+  const createdAtSec = typeof row.created_at === "number" ? row.created_at : Math.floor(Date.now() / 1000);
+  const updatedAtSec = typeof row.completed_at === "number" ? row.completed_at :
+    (typeof row.started_at === "number" ? row.started_at : createdAtSec);
+
+  return {
+    id: String(row.id),
+    title: String(row.title || "Untitled Task"),
+    description: String(row.body || ""),
+    status: mapKanbanToGatewayStatus(row.status),
+    assignedAgentId: row.assignee ? String(row.assignee).toLowerCase() : undefined,
+    createdAt: new Date(createdAtSec * 1000).toISOString(),
+    updatedAt: new Date(updatedAtSec * 1000).toISOString(),
+    channel: "kreasi-kita",
+    notes: row.last_failure_error ? String(row.last_failure_error) : undefined,
+    archived: row.status === "archived",
+  };
+}
+
+function scanLocalSkills(dir) {
+  const results = [];
+  if (!fs.existsSync(dir)) return results;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const skillMd = path.join(full, "SKILL.md");
+        if (fs.existsSync(skillMd)) {
+          try {
+            const content = fs.readFileSync(skillMd, "utf8");
+            const matchName = content.match(/^name:\s*(.+)$/m);
+            const matchDesc = content.match(/^description:\s*["']?([^"'\n]+)["']?/m);
+            results.push({
+              name: matchName ? matchName[1].trim() : entry.name,
+              description: matchDesc ? matchDesc[1].trim() : "Custom agency capability.",
+              category: path.basename(dir),
+              filePath: skillMd,
+            });
+          } catch {}
+        } else {
+          results.push(...scanLocalSkills(full));
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[hermes-adapter] scanLocalSkills error:", err.message);
+  }
+  return results;
+}
 
 function loadDotenvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -1356,8 +1461,37 @@ async function handleMethod(method, params, id, sendEvent) {
 
     // --- Skills & models ----------------------------------------------------
 
-    case "skills.status":
-      return resOk(id, { skills: [] });
+    case "skills.status": {
+      try {
+        const localSkills = scanLocalSkills(SKILLS_DIR);
+        const formatted = localSkills.map((s) => ({
+          name: s.name,
+          description: s.description,
+          source: "hermes-managed",
+          bundled: false,
+          filePath: s.filePath,
+          baseDir: path.dirname(s.filePath),
+          skillKey: s.name,
+          category: s.category,
+          always: false,
+          disabled: false,
+          blockedByAllowlist: false,
+          eligible: true,
+          requirements: { bins: [], anyBins: [], env: [], config: [], os: [] },
+          missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
+          configChecks: [],
+          install: [],
+        }));
+        return resOk(id, {
+          workspaceDir: AGENTS_DIR,
+          managedSkillsDir: SKILLS_DIR,
+          skills: formatted,
+        });
+      } catch (err) {
+        console.error("[hermes-adapter] skills.status error:", err.message);
+        return resOk(id, { workspaceDir: AGENTS_DIR, managedSkillsDir: SKILLS_DIR, skills: [] });
+      }
+    }
 
     case "models.list":
       try {
@@ -1372,8 +1506,118 @@ async function handleMethod(method, params, id, sendEvent) {
         return resOk(id, { models: [{ id: HERMES_MODEL, name: HERMES_MODEL }] });
       }
 
-    case "tasks.list":
-      return resOk(id, { tasks: [] });
+    case "tasks.list": {
+      const db = getKanbanDb(true);
+      if (!db) {
+        return resOk(id, { tasks: [] });
+      }
+      try {
+        const includeArchived = p.includeArchived === true;
+        const query = includeArchived
+          ? "SELECT * FROM tasks ORDER BY created_at DESC"
+          : "SELECT * FROM tasks WHERE status != 'archived' ORDER BY created_at DESC";
+        const rows = db.prepare(query).all();
+        const tasks = rows.map(formatTaskRecord);
+        return resOk(id, { tasks });
+      } catch (err) {
+        console.error("[hermes-adapter] tasks.list error:", err.message);
+        return resOk(id, { tasks: [] });
+      }
+    }
+
+    case "tasks.create": {
+      const title = typeof p.title === "string" ? p.title.trim() : "";
+      if (!title) return resErr(id, "bad_request", "Title is required");
+      const description = typeof p.description === "string" ? p.description : "";
+      const assignee = typeof p.assignedAgentId === "string" ? p.assignedAgentId.trim() : "";
+
+      try {
+        const args = ["kanban", "--board", "kreasi-kita", "create", title, "--body", description, "--json"];
+        if (assignee) {
+          args.push("--assignee", assignee);
+        }
+        const out = child_process.execFileSync("hermes", args, { encoding: "utf8", timeout: 10000 });
+        const created = JSON.parse(out);
+        return resOk(id, formatTaskRecord(created));
+      } catch (err) {
+        console.error("[hermes-adapter] tasks.create fallback:", err.message);
+        const db = getKanbanDb(false);
+        if (db) {
+          const newId = "t_" + Math.random().toString(16).slice(2, 10);
+          const nowSec = Math.floor(Date.now() / 1000);
+          const kStatus = mapGatewayToKanbanStatus(p.status || "inbox");
+          db.prepare(`
+            INSERT INTO tasks (id, title, body, status, assignee, created_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, 'hermes3d')
+          `).run(newId, title, description, kStatus, assignee || null, nowSec);
+          return resOk(id, {
+            id: newId,
+            title,
+            description,
+            status: p.status || "inbox",
+            assignedAgentId: assignee || undefined,
+            createdAt: new Date(nowSec * 1000).toISOString(),
+            updatedAt: new Date(nowSec * 1000).toISOString(),
+            channel: "kreasi-kita",
+          });
+        }
+        return resErr(id, "internal_error", err.message);
+      }
+    }
+
+    case "tasks.update": {
+      const taskId = typeof p.id === "string" ? p.id.trim() : "";
+      if (!taskId) return resErr(id, "bad_request", "Task id is required");
+      const db = getKanbanDb(false);
+      if (!db) return resErr(id, "internal_error", "Database unavailable");
+
+      try {
+        const existing = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+        if (!existing) return resErr(id, "not_found", `Task ${taskId} not found`);
+
+        let newStatus = existing.status;
+        if (p.status) {
+          newStatus = mapGatewayToKanbanStatus(p.status);
+        }
+        if (p.archived === true) {
+          newStatus = "archived";
+        }
+
+        const newTitle = typeof p.title === "string" ? p.title : existing.title;
+        const newBody = typeof p.description === "string" ? p.description : existing.body;
+        const newAssignee = typeof p.assignedAgentId === "string" ? p.assignedAgentId : existing.assignee;
+        const nowSec = Math.floor(Date.now() / 1000);
+        const completedAt = newStatus === "done" ? (existing.completed_at || nowSec) : null;
+        const startedAt = newStatus === "in_progress" ? (existing.started_at || nowSec) : existing.started_at;
+
+        db.prepare(`
+          UPDATE tasks
+          SET title = ?, body = ?, status = ?, assignee = ?, completed_at = ?, started_at = ?
+          WHERE id = ?
+        `).run(newTitle, newBody, newStatus, newAssignee, completedAt, startedAt, taskId);
+
+        const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+        return resOk(id, formatTaskRecord(updated));
+      } catch (err) {
+        console.error("[hermes-adapter] tasks.update error:", err.message);
+        return resErr(id, "internal_error", err.message);
+      }
+    }
+
+    case "tasks.delete": {
+      const taskId = typeof p.id === "string" ? p.id.trim() : "";
+      if (!taskId) return resErr(id, "bad_request", "Task id is required");
+      const db = getKanbanDb(false);
+      if (!db) return resErr(id, "internal_error", "Database unavailable");
+
+      try {
+        db.prepare("UPDATE tasks SET status = 'archived' WHERE id = ?").run(taskId);
+        return resOk(id, { ok: true, removed: true });
+      } catch (err) {
+        console.error("[hermes-adapter] tasks.delete error:", err.message);
+        return resErr(id, "internal_error", err.message);
+      }
+    }
 
     // --- Cron jobs ----------------------------------------------------------
 
@@ -1496,7 +1740,7 @@ function startAdapter() {
               "agents.files.get","agents.files.set",
               "exec.approvals.get","exec.approvals.set","exec.approval.resolve",
               "wake","skills.status","models.list",
-              "tasks.list",
+              "tasks.list","tasks.create","tasks.update","tasks.delete",
               "cron.list","cron.add","cron.remove","cron.patch","cron.run"],
               events: ["chat","presence","heartbeat","cron"] },
             snapshot: { health: { agents: allAgents, defaultAgentId: AGENT_ID },
