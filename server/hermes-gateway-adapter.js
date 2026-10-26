@@ -163,14 +163,16 @@ function loadRuntimeEnv() {
   const cwd = process.cwd();
   loadDotenvFile(path.join(cwd, ".env.local"));
   loadDotenvFile(path.join(cwd, ".env"));
+  const homeDir = process.env.HOME || "/home/ubuntu";
+  loadDotenvFile(path.join(homeDir, ".hermes", ".env"));
 }
 
 loadRuntimeEnv();
 
 const HERMES_API_URL = (process.env.HERMES_API_URL || "http://localhost:8642").replace(/\/$/, "");
-const HERMES_API_KEY = process.env.HERMES_API_KEY || "";
+const HERMES_API_KEY = process.env.HERMES_API_KEY || process.env.API_SERVER_KEY || "";
 const ADAPTER_PORT = parseInt(process.env.HERMES_ADAPTER_PORT || "18789", 10);
-const HERMES_MODEL = process.env.HERMES_MODEL || "hermes";
+const HERMES_MODEL = process.env.HERMES_MODEL || "conversation";
 const HERMES_AGENT_NAME = process.env.HERMES_AGENT_NAME || "Hermes";
 const HOME = process.env.HOME || "/tmp";
 
@@ -638,6 +640,22 @@ function extractOpenAiStyleError(payload, fallbackMessage) {
   return fallbackMessage;
 }
 
+const KNOWN_MODEL_LABELS = {
+  "conversation": "conversation (9Router HQ Default)",
+  "high_code": "high_code (9Router Coding & Architecture)",
+  "med": "med (9Router Growth, Social & Copy)",
+  "kr/deepseek-3.2": "kr/deepseek-3.2 (DeepSeek Reasoner)",
+  "ag/claude-sonnet-4-6": "ag/claude-sonnet-4-6 (Claude 3.7 Sonnet)",
+  "ag/claude-opus-5-5-high": "ag/claude-opus-5-5-high (Claude Opus)",
+  "kr/claude-sonnet-4.5": "kr/claude-sonnet-4.5 (Claude 3.5 Sonnet)",
+  "cx/gpt-5.6-luna": "cx/gpt-5.6-luna (GPT-5.6 Luna)",
+  "cx/gpt-6.1-sol": "cx/gpt-6.1-sol (GPT-6.1 Sol)",
+  "op-zen/mimo-v2.5-pro": "op-zen/mimo-v2.5-pro (Mimo Pro)",
+  "oc/minimax-m3-free": "oc/minimax-m3-free (MiniMax M3)",
+  "oc/deepseek-v4-flash-free": "oc/deepseek-v4-flash-free (DeepSeek Flash)",
+  "hermes-agent": "hermes-agent (Local API Fallback)",
+};
+
 let cachedHermesModels = null;
 let cachedHermesModelsAt = 0;
 
@@ -646,45 +664,73 @@ async function fetchHermesModels() {
   if (cachedHermesModels && now - cachedHermesModelsAt < 30_000) {
     return cachedHermesModels;
   }
-  const res = await hermesGet("/v1/models");
-  if (res.statusCode >= 400) {
-    res.resume();
-    throw new Error(`Hermes models API HTTP ${res.statusCode}`);
+
+  let rawIds = [];
+  try {
+    const routerReq = await new Promise((resolve, reject) => {
+      const req = http.get("http://127.0.0.1:20128/v1/models", { timeout: 3000 }, resolve);
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("9router timeout")); });
+    });
+    if (routerReq.statusCode === 200) {
+      const payload = await readJsonBody(routerReq);
+      if (Array.isArray(payload?.data)) {
+        rawIds = payload.data.map((m) => (typeof m?.id === "string" ? m.id.trim() : "")).filter(Boolean);
+      }
+    }
+  } catch {
+    // 9Router direct query skipped or failed
   }
-  const payload = await readJsonBody(res);
-  const models = Array.isArray(payload?.data)
-    ? payload.data
-        .map((entry) => (typeof entry?.id === "string" ? entry.id.trim() : ""))
-        .filter(Boolean)
-    : [];
-  cachedHermesModels = models;
+
+  if (rawIds.length === 0) {
+    try {
+      const res = await hermesGet("/v1/models");
+      if (res.statusCode < 400) {
+        const payload = await readJsonBody(res);
+        if (Array.isArray(payload?.data)) {
+          rawIds = payload.data.map((m) => (typeof m?.id === "string" ? m.id.trim() : "")).filter(Boolean);
+        }
+      }
+    } catch {
+      // Hermes API fallback
+    }
+  }
+
+  const priorityDefaults = [
+    "conversation",
+    "high_code",
+    "med",
+    "kr/deepseek-3.2",
+    "ag/claude-sonnet-4-6",
+    "ag/claude-opus-5-5-high",
+    "kr/claude-sonnet-4.5",
+    "cx/gpt-5.6-luna",
+    "hermes-agent",
+  ];
+
+  const uniqueIds = Array.from(new Set([...priorityDefaults, ...rawIds]));
+
+  const catalog = uniqueIds.map((id) => ({
+    id,
+    name: KNOWN_MODEL_LABELS[id] || id,
+    provider: "hermes",
+    reasoning: id.includes("deepseek") || id.includes("high_code") || id.includes("opus"),
+  }));
+
+  cachedHermesModels = catalog;
   cachedHermesModelsAt = now;
-  return models;
+  return catalog;
 }
 
-async function resolveHermesModel(requestedModel) {
-  const trimmed = typeof requestedModel === "string" ? requestedModel.trim() : "";
-  const normalized = trimmed.includes("/") ? trimmed.split("/").pop().trim() : trimmed;
-  try {
-    const models = await fetchHermesModels();
-    if (models.length === 0) {
-      return normalized || trimmed || HERMES_MODEL;
-    }
-    const candidates = [trimmed, normalized, HERMES_MODEL]
-      .map((value) => (typeof value === "string" ? value.trim() : ""))
-      .filter(Boolean);
-    for (const candidate of candidates) {
-      const exact = models.find((modelId) => modelId === candidate);
-      if (exact) return exact;
-    }
-    for (const candidate of candidates) {
-      const suffix = models.find((modelId) => modelId.endsWith(`/${candidate}`));
-      if (suffix) return suffix;
-    }
-    return models[0];
-  } catch {
-    return normalized || trimmed || HERMES_MODEL;
+function resolveHermesModel(requestedModel) {
+  if (typeof requestedModel !== "string") return HERMES_MODEL;
+  let clean = requestedModel.trim();
+  if (clean.startsWith("hermes/")) {
+    clean = clean.slice("hermes/".length).trim();
+  } else if (clean.startsWith("custom/")) {
+    clean = clean.slice("custom/".length).trim();
   }
+  return clean || HERMES_MODEL;
 }
 
 async function completeOneTurn(messages, model, tools) {
@@ -1198,6 +1244,7 @@ async function handleMethod(method, params, id, sendEvent) {
         id: agent.id, name: agent.name, workspace: agent.workspace,
         identity: { name: agent.name, emoji: agent.emoji || "🤖" },
         role: agent.role,
+        model: agent.settings?.model ? `hermes/${agent.settings.model}` : "hermes/conversation",
       }));
       return resOk(id, { defaultId: "baron", mainKey: MAIN_KEY, agents: allAgents });
     }
@@ -1232,6 +1279,10 @@ async function handleMethod(method, params, id, sendEvent) {
         if (typeof p.name === "string" && p.name.trim()) existing.name = p.name.trim();
         if (typeof p.workspace === "string" && p.workspace.trim()) existing.workspace = p.workspace.trim();
         if (typeof p.role === "string") existing.role = p.role.trim();
+        if (typeof p.model === "string" && p.model.trim()) {
+          existing.settings = existing.settings || { wipe: false, continuity: true, model: HERMES_MODEL };
+          existing.settings.model = resolveHermesModel(p.model);
+        }
       }
       return resOk(id, { ok: true, removedBindings: 0 });
     }
@@ -1311,6 +1362,12 @@ async function handleMethod(method, params, id, sendEvent) {
       return resOk(id, { ts: Date.now(), previews });
     }
 
+    case "sessions.usage":
+      return resOk(id, { sessions: [] });
+
+    case "usage.cost":
+      return resOk(id, { costDaily: [], totalCost: 0 });
+
     case "sessions.patch": {
       const key = typeof p.key === "string" ? p.key : MAIN_SESSION_KEY;
       const current = sessionSettings.get(key) || {};
@@ -1335,8 +1392,9 @@ async function handleMethod(method, params, id, sendEvent) {
     // --- Chat ---------------------------------------------------------------
 
     case "chat.send": {
-      const sessionKey = typeof p.sessionKey === "string" ? p.sessionKey : MAIN_SESSION_KEY;
-      const userMessage = typeof p.message === "string" ? p.message.trim() : String(p.message || "").trim();
+      const sessionKey = typeof p.sessionKey === "string" ? p.sessionKey : (p.agentId ? `agent:${p.agentId}:${MAIN_KEY}` : MAIN_SESSION_KEY);
+      const rawMsg = p.message || p.text || "";
+      const userMessage = typeof rawMsg === "string" ? rawMsg.trim() : String(rawMsg || "").trim();
       const runId = (typeof p.idempotencyKey === "string" && p.idempotencyKey) ? p.idempotencyKey : randomId();
 
       if (!userMessage) return resOk(id, { status: "no-op", runId });
@@ -1501,14 +1559,16 @@ async function handleMethod(method, params, id, sendEvent) {
     case "models.list":
       try {
         const models = await fetchHermesModels();
-        return resOk(id, {
-          models: (models.length > 0 ? models : [HERMES_MODEL]).map((modelId) => ({
-            id: modelId,
-            name: modelId,
-          })),
-        });
+        return resOk(id, { models });
       } catch {
-        return resOk(id, { models: [{ id: HERMES_MODEL, name: HERMES_MODEL }] });
+        return resOk(id, {
+          models: [
+            { id: "conversation", name: "conversation (9Router HQ Default)", provider: "hermes" },
+            { id: "high_code", name: "high_code (9Router Coding & Architecture)", provider: "hermes" },
+            { id: "med", name: "med (9Router Growth, Social & Copy)", provider: "hermes" },
+            { id: "kr/deepseek-3.2", name: "kr/deepseek-3.2 (DeepSeek Reasoner)", provider: "hermes", reasoning: true },
+          ],
+        });
       }
 
     case "tasks.list": {
