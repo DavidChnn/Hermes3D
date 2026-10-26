@@ -28,7 +28,6 @@ const securityHeaders = [
       "media-src 'self' blob: data: http: https:",
       "worker-src 'self' blob:",
       "object-src 'none'",
-      "upgrade-insecure-requests",
     ].join("; "),
   },
   {
@@ -53,12 +52,14 @@ const securityHeaders = [
   },
 ];
 
+/*
 if (process.env.NODE_ENV === "production") {
   securityHeaders.push({
     key: "Strict-Transport-Security",
     value: "max-age=31536000; includeSubDomains",
   });
 }
+*/
 
 const nextConfig: NextConfig = {
   turbopack: {

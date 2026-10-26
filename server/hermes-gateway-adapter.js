@@ -25,7 +25,10 @@ const http = require("http");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const child_process = require("child_process");
 const { WebSocketServer } = require("ws");
+
+const AGENTS_DIR = path.resolve("/home/ubuntu/hq/agents");
 
 function loadDotenvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -63,7 +66,7 @@ const HERMES_MODEL = process.env.HERMES_MODEL || "hermes";
 const HERMES_AGENT_NAME = process.env.HERMES_AGENT_NAME || "Hermes";
 const HOME = process.env.HOME || "/tmp";
 
-const AGENT_ID = "hermes";
+const AGENT_ID = "baron";
 const MAIN_KEY = "main";
 const MAIN_SESSION_KEY = `agent:${AGENT_ID}:${MAIN_KEY}`;
 const CONFIG_PATH = `${HOME}/.hermes/config.json`;
@@ -195,6 +198,63 @@ const TEAM_TOOLS = [
   },
 ];
 
+const OPERATIONAL_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "dispatch_task",
+      description: "Dispatch an asynchronous worker task to a Kreasi Kita agent profile via hq_dispatch.py with Kanban tracking and Telegram updates.",
+      parameters: {
+        type: "object",
+        required: ["task"],
+        properties: {
+          task: { type: "string", description: "Detailed task description to execute" },
+          agent: { type: "string", description: "Target agent ID (baron, salsa, fajar, gilang, dinda, satria, bima, tara, nadia, ops). Defaults to current agent." },
+          project: { type: "string", description: "Target project (kreasi-kita, digiloot, mahakam_furniture, fe-pidzybox, be-pidzybox). Default: kreasi-kita." },
+          tier: { type: "integer", description: "Approval tier (1=standard, 2=PM review, 3=founder approval required). Default: 1." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "notify_telegram",
+      description: "Send a message or status update directly to a Kreasi Kita Telegram HQ topic.",
+      parameters: {
+        type: "object",
+        required: ["text"],
+        properties: {
+          text: { type: "string", description: "Message text formatted in Markdown" },
+          topic: { type: "string", description: "Telegram topic ID or key (e.g. 5671, 5673, 5675, dev, growth, qa, etc.). Defaults to this agent's topic." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_services_status",
+      description: "Check health status of all Kreasi Kita services (Twenty CRM, Umami, Documenso, PocketBase, HQ server).",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description: "Execute a safe shell command to inspect repository or environment state (git, docker, files).",
+      parameters: {
+        type: "object",
+        required: ["command"],
+        properties: {
+          command: { type: "string", description: "Shell command to run" },
+        },
+      },
+    },
+  },
+];
+
 // ---------------------------------------------------------------------------
 // In-memory state
 // ---------------------------------------------------------------------------
@@ -222,13 +282,115 @@ const cronJobs = new Map();
  * }>}
  */
 const agentRegistry = new Map([
-  [AGENT_ID, {
-    id: AGENT_ID,
-    name: HERMES_AGENT_NAME,
-    workspace: `${HOME}/.hermes/workspace-hermes`,
-    role: "Orchestrator",
+  ["baron", {
+    id: "baron",
+    name: "Baron (Orchestrator)",
+    workspace: path.join(AGENTS_DIR, "baron"),
+    role: "Agency Orchestrator & AI Lead",
+    emoji: "🎯",
+    topic: 5671,
+    profile: "default",
     systemPrompt: ORCHESTRATOR_SYSTEM_PROMPT,
     settings: { wipe: false, continuity: true, model: HERMES_MODEL },
+  }],
+  ["salsa", {
+    id: "salsa",
+    name: "Salsa (PM)",
+    workspace: path.join(AGENTS_DIR, "salsa"),
+    role: "Project Manager & Scope Guard",
+    emoji: "📋",
+    topic: 5673,
+    profile: "default",
+    systemPrompt: "You are Salsa, Project Manager & Scope Guard at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
+  }],
+  ["fajar", {
+    id: "fajar",
+    name: "Fajar (Tech Lead)",
+    workspace: path.join(AGENTS_DIR, "fajar"),
+    role: "Frontend Engineer & System Architect",
+    emoji: "⚡",
+    topic: 5675,
+    profile: "dev",
+    systemPrompt: "You are Fajar, Tech Lead & Frontend Engineer at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
+  }],
+  ["gilang", {
+    id: "gilang",
+    name: "Gilang (Fullstack Dev)",
+    workspace: path.join(AGENTS_DIR, "gilang"),
+    role: "Backend & Data Architecture Engineer",
+    emoji: "🛠️",
+    topic: 5675,
+    profile: "dev",
+    systemPrompt: "You are Gilang, Backend & Fullstack Engineer at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
+  }],
+  ["dinda", {
+    id: "dinda",
+    name: "Dinda (QA & Code Review)",
+    workspace: path.join(AGENTS_DIR, "dinda"),
+    role: "QA Automation & Quality Assurance",
+    emoji: "🧪",
+    topic: 5908,
+    profile: "dev",
+    systemPrompt: "You are Dinda, QA Automation & Quality Assurance Engineer at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
+  }],
+  ["satria", {
+    id: "satria",
+    name: "Satria (Security & Pentest)",
+    workspace: path.join(AGENTS_DIR, "satria"),
+    role: "Security Engineer & Penetration Tester",
+    emoji: "🛡️",
+    topic: 5909,
+    profile: "dev",
+    systemPrompt: "You are Satria, Security Engineer & Penetration Tester at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
+  }],
+  ["bima", {
+    id: "bima",
+    name: "Bima (Growth & SEO)",
+    workspace: path.join(AGENTS_DIR, "bima"),
+    role: "SEO & Technical Growth Specialist",
+    emoji: "📈",
+    topic: 5677,
+    profile: "growth",
+    systemPrompt: "You are Bima, SEO & Technical Growth Specialist at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "med" },
+  }],
+  ["tara", {
+    id: "tara",
+    name: "Tara (Copywriter)",
+    workspace: path.join(AGENTS_DIR, "tara"),
+    role: "Content Writer & Brand Copywriter",
+    emoji: "✍️",
+    topic: 5677,
+    profile: "growth",
+    systemPrompt: "You are Tara, Content Writer & Brand Copywriter at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "med" },
+  }],
+  ["nadia", {
+    id: "nadia",
+    name: "Nadia (Social Media)",
+    workspace: path.join(AGENTS_DIR, "nadia"),
+    role: "Social Media Strategist & Visual Creative",
+    emoji: "🎨",
+    topic: 5679,
+    profile: "growth",
+    systemPrompt: "You are Nadia, Social Media Strategist & Visual Creative at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "med" },
+  }],
+  ["ops", {
+    id: "ops",
+    name: "Ops (DevOps)",
+    workspace: path.join(AGENTS_DIR, "ops"),
+    role: "DevOps & Infrastructure Engineer",
+    emoji: "⚙️",
+    topic: 5681,
+    profile: "dev",
+    systemPrompt: "You are Ops, DevOps & Infrastructure Engineer at Kreasi Kita.",
+    settings: { wipe: false, continuity: true, model: "high_code" },
   }],
 ]);
 
@@ -739,8 +901,94 @@ function execReadAgentContext(args) {
   });
 }
 
-async function executeToolCall(tc, sendEvent) {
+function loadAgentSystemPrompt(agentId) {
+  const dir = path.join(AGENTS_DIR, agentId);
+  if (!fs.existsSync(dir)) return null;
+
+  const parts = [];
+  const files = ["SOUL.md", "AGENTS.md", "USER.md", "MEMORY.md", "TOOLS.md"];
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    if (fs.existsSync(fp)) {
+      parts.push(fs.readFileSync(fp, "utf8"));
+    }
+  }
+  return parts.length > 0 ? parts.join("\n\n---\n\n") : null;
+}
+
+function execDispatchTask(args, currentAgentId) {
+  const targetAgent = args.agent || currentAgentId || "baron";
+  const project = args.project || "kreasi-kita";
+  const task = args.task || "";
+  const tier = args.tier || 1;
+  if (!task) return JSON.stringify({ ok: false, error: "Task description is required" });
+
+  try {
+    const child = child_process.spawn("python3", [
+      "/home/ubuntu/hq/scripts/hq_dispatch.py",
+      "--agent", targetAgent,
+      "--project", project,
+      "--task", task,
+      "--tier", String(tier)
+    ], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    return JSON.stringify({
+      ok: true,
+      status: "dispatched",
+      agent: targetAgent,
+      project,
+      task,
+      message: `Task successfully dispatched to worker '${targetAgent}' on project '${project}'. Updates will stream to Telegram and Kanban.`
+    });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: err.message });
+  }
+}
+
+function execNotifyTelegram(args, currentAgent) {
+  const text = args.text || "";
+  const topic = args.topic || currentAgent?.topic || "5671";
+  if (!text) return JSON.stringify({ ok: false, error: "Text is required" });
+  try {
+    const res = child_process.spawnSync("python3", ["/home/ubuntu/hq/scripts/telegram_notify.py", "--topic", String(topic), "--text", text], {
+      timeout: 10000,
+      encoding: "utf8",
+    });
+    return JSON.stringify({ ok: res.status === 0, output: (res.stdout || res.stderr || "").trim() });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: err.message });
+  }
+}
+
+async function execGetServicesStatus() {
+  try {
+    const res = await fetch("http://127.0.0.1:8088/api/services-status");
+    const json = await res.json();
+    return JSON.stringify(json);
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: err.message });
+  }
+}
+
+function execRunCommand(args) {
+  const command = args.command || "";
+  if (!command || /rm\s+-rf\s+\/|mkfs|dd\s+if=/i.test(command)) {
+    return JSON.stringify({ ok: false, error: "Dangerous or empty command blocked." });
+  }
+  try {
+    const output = child_process.execSync(command, { timeout: 15000, maxBuffer: 1024 * 1024, encoding: "utf8" });
+    return JSON.stringify({ ok: true, output: output.slice(0, 3000) });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: (err.stderr || err.stdout || err.message).slice(0, 1000) });
+  }
+}
+
+async function executeToolCall(tc, sendEvent, agentId) {
   console.log(`[hermes-adapter] Tool call: ${tc.name}`, JSON.stringify(tc.args).slice(0, 120));
+  const currentAgent = agentRegistry.get(agentId);
   switch (tc.name) {
     case "spawn_agent":          return execSpawnAgent(tc.args, sendEvent);
     case "delegate_task":        return execDelegateTask(tc.args, sendEvent);
@@ -748,6 +996,10 @@ async function executeToolCall(tc, sendEvent) {
     case "configure_agent":      return execConfigureAgent(tc.args);
     case "dismiss_agent":        return execDismissAgent(tc.args);
     case "read_agent_context":   return execReadAgentContext(tc.args);
+    case "dispatch_task":        return execDispatchTask(tc.args, agentId);
+    case "notify_telegram":      return execNotifyTelegram(tc.args, currentAgent);
+    case "get_services_status":  return execGetServicesStatus();
+    case "run_command":          return execRunCommand(tc.args);
     default:                     return JSON.stringify({ ok: false, error: `Unknown tool: ${tc.name}` });
   }
 }
@@ -758,7 +1010,9 @@ async function executeToolCall(tc, sendEvent) {
 
 async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, emitDelta, abortCheck, sendEvent }) {
   const agent = agentRegistry.get(agentId);
-  const systemMsg = agent?.systemPrompt ? [{ role: "system", content: agent.systemPrompt }] : [];
+  const promptFromFiles = loadAgentSystemPrompt(agentId);
+  const prompt = promptFromFiles || agent?.systemPrompt || ORCHESTRATOR_SYSTEM_PROMPT;
+  const systemMsg = prompt ? [{ role: "system", content: prompt }] : [];
   const history = getHistory(sessionKey);
   const contextHistory = (agent?.settings?.wipe) ? [] : [...history];
   let messages = [...systemMsg, ...contextHistory, { role: "user", content: userMessage }];
@@ -791,7 +1045,7 @@ async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, 
       // Execute all tool calls and collect results
       const toolResults = await Promise.all(
         toolCalls.map(async (tc) => {
-          const result = await executeToolCall(tc, sendEvent);
+          const result = await executeToolCall(tc, sendEvent, agentId);
           return { role: "tool", tool_call_id: tc.id, content: result };
         })
       );
@@ -834,10 +1088,10 @@ async function handleMethod(method, params, id, sendEvent) {
     case "agents.list": {
       const allAgents = [...agentRegistry.values()].map((agent) => ({
         id: agent.id, name: agent.name, workspace: agent.workspace,
-        identity: { name: agent.name, emoji: "🤖" },
+        identity: { name: agent.name, emoji: agent.emoji || "🤖" },
         role: agent.role,
       }));
-      return resOk(id, { defaultId: AGENT_ID, mainKey: MAIN_KEY, agents: allAgents });
+      return resOk(id, { defaultId: "baron", mainKey: MAIN_KEY, agents: allAgents });
     }
 
     case "agents.create": {
@@ -845,7 +1099,7 @@ async function handleMethod(method, params, id, sendEvent) {
       const slug = agentName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       const newId = `${slug}-${randomId().slice(0, 6)}`;
       const workspace = (typeof p.workspace === "string" && p.workspace)
-        ? p.workspace : `${HOME}/.hermes/workspace-${slug}`;
+        ? p.workspace : path.join(AGENTS_DIR, newId);
       agentRegistry.set(newId, {
         id: newId, name: agentName, workspace,
         role: "", systemPrompt: `You are ${agentName}.`,
@@ -875,15 +1129,32 @@ async function handleMethod(method, params, id, sendEvent) {
     }
 
     case "agents.files.get": {
-      const key = `${p.agentId || AGENT_ID}/${p.name || ""}`;
-      const content = agentFiles.get(key);
-      return resOk(id, { file: content !== undefined ? { content } : { missing: true } });
+      const agentId = p.agentId || AGENT_ID;
+      const fileName = p.name || "";
+      const filePath = path.join(AGENTS_DIR, agentId, fileName);
+      if (fs.existsSync(filePath)) {
+        const content = fs.readFileSync(filePath, "utf8");
+        return resOk(id, {
+          file: {
+            content,
+            path: filePath,
+            exists: true,
+          },
+          workspace: path.join(AGENTS_DIR, agentId),
+        });
+      }
+      return resOk(id, { file: { missing: true } });
     }
 
     case "agents.files.set": {
-      const key = `${p.agentId || AGENT_ID}/${p.name || ""}`;
-      agentFiles.set(key, typeof p.content === "string" ? p.content : "");
-      return resOk(id, {});
+      const agentId = p.agentId || AGENT_ID;
+      const fileName = p.name || "";
+      const filePath = path.join(AGENTS_DIR, agentId, fileName);
+      if (typeof p.content === "string") {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, p.content, "utf8");
+      }
+      return resOk(id, { ok: true });
     }
 
     // --- Config -------------------------------------------------------------
@@ -990,8 +1261,7 @@ async function handleMethod(method, params, id, sendEvent) {
         };
 
         try {
-          // Only the orchestrator gets team management tools
-          const tools = isOrchestrator ? TEAM_TOOLS : [];
+          const tools = isOrchestrator ? [...TEAM_TOOLS, ...OPERATIONAL_TOOLS] : OPERATIONAL_TOOLS;
 
           const finalText = await runAgenticLoop({
             sessionKey, agentId: sessionAgentId, userMessage,
