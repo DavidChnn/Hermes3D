@@ -117,8 +117,11 @@ function scanLocalSkills(dir) {
             const content = fs.readFileSync(skillMd, "utf8");
             const matchName = content.match(/^name:\s*(.+)$/m);
             const matchDesc = content.match(/^description:\s*["']?([^"'\n]+)["']?/m);
+            const matchMetaKey = content.match(/["']skillKey["']\s*:\s*["']([^"']+)["']/);
+            const skillKey = matchMetaKey ? matchMetaKey[1].trim() : entry.name;
             results.push({
               name: matchName ? matchName[1].trim() : entry.name,
+              skillKey,
               description: matchDesc ? matchDesc[1].trim() : "Custom agency capability.",
               category: path.basename(dir),
               filePath: skillMd,
@@ -1467,11 +1470,13 @@ async function handleMethod(method, params, id, sendEvent) {
         const formatted = localSkills.map((s) => ({
           name: s.name,
           description: s.description,
-          source: "hermes-managed",
+          source: (s.skillKey === "todo-board" || s.skillKey === "task-manager" || s.skillKey === "soundhermes")
+            ? "hermes-workspace"
+            : "hermes-managed",
           bundled: false,
           filePath: s.filePath,
           baseDir: path.dirname(s.filePath),
-          skillKey: s.name,
+          skillKey: s.skillKey || s.name,
           category: s.category,
           always: false,
           disabled: false,
